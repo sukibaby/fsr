@@ -23,6 +23,20 @@ import (
 	"github.com/tarm/serial"
 )
 
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
 type ProfileHandler struct {
 	Filename   string
 	Profiles   map[string][]int
@@ -34,46 +48,7 @@ type ProfileHandler struct {
 type SerialHandler struct {
 	Port       string
 	BaudRate   int
-	Seriafunc onStartup() {
-	profileHandler.LoadProfiles()
-
-	go serialHandler.WriteLoop()
-	go serialHandler.ReadLoop()
-}
-
-func onShutdown() {
-	log.Println("Cleaning up connections...")
-	
-	// Close all websocket connections
-	wsLock.Lock()
-	for _, ws := range activeWebSockets {
-		ws.WriteMessage(websocket.CloseMessage, 
-			websocket.FormatCloseMessage(websocket.CloseGoingAway, "Server shutdown"))
-		ws.Close()
-	}
-	activeWebSockets = nil
-	wsLock.Unlock()
-
-	// Close all client connections
-	clientsMux.Lock()
-	for client := range clients {
-		client.conn.WriteMessage(websocket.CloseMessage, 
-			websocket.FormatCloseMessage(websocket.CloseGoingAway, "Server shutdown"))
-		client.conn.Close()
-		delete(clients, client)
-	}
-	clientsMux.Unlock()
-
-	// Close serial connection
-	if serialHandler.SerialPort != nil {
-		serialHandler.SerialPort.Close()
-	}
-
-	// Signal shutdown to all goroutines
-	close(shutdownSignal)
-}
-
-func getIndex(w http.ResponseWriter, r *http.Request) {t
+	SerialPort *serial.Port
 	WriteQueue chan string
 	Profile    *ProfileHandler
 	NoSerial   bool
@@ -94,7 +69,7 @@ var (
 
 	// List of active websocket connections
 	activeWebSockets []*websocket.Conn
-	wsLock          sync.Mutex
+	wsLock           sync.Mutex
 
 	// Channel for broadcasting messages to all clients
 	broadcast = make(chan []interface{}, 256)
@@ -106,12 +81,55 @@ var (
 		CheckOrigin: func(r *http.Request) bool {
 			return true
 		},
+		EnableCompression: true,
 	}
 
 	// Global handlers for WebSocket handlers to access
 	profileHandler *ProfileHandler
 	serialHandler  *SerialHandler
+
+	// Build directory for static files
+	buildDir = filepath.Join(filepath.Dir(filepath.Dir(os.Args[0])), "build")
 )
+
+func onStartup() {
+	profileHandler.LoadProfiles()
+
+	go serialHandler.WriteLoop()
+	go serialHandler.ReadLoop()
+}
+
+func onShutdown() {
+	log.Println("Cleaning up connections...")
+
+	// Close all websocket connections
+	wsLock.Lock()
+	for _, ws := range activeWebSockets {
+		ws.WriteMessage(websocket.CloseMessage,
+			websocket.FormatCloseMessage(websocket.CloseGoingAway, "Server shutdown"))
+		ws.Close()
+	}
+	activeWebSockets = nil
+	wsLock.Unlock()
+
+	// Close all client connections
+	clientsMux.Lock()
+	for client := range clients {
+		client.conn.WriteMessage(websocket.CloseMessage,
+			websocket.FormatCloseMessage(websocket.CloseGoingAway, "Server shutdown"))
+		client.conn.Close()
+		delete(clients, client)
+	}
+	clientsMux.Unlock()
+
+	// Close serial connection
+	if serialHandler.SerialPort != nil {
+		serialHandler.SerialPort.Close()
+	}
+
+	// Signal shutdown to all goroutines
+	close(shutdownSignal)
+}
 
 func NewProfileHandler(filename string, numSensors int) *ProfileHandler {
 	return &ProfileHandler{
@@ -301,6 +319,9 @@ func (s *SerialHandler) Open() bool {
 		return false
 	}
 	s.SerialPort = port
+	log.Printf("[SERIAL] Device detected on %s", s.Port)
+	thresholds := s.Profile.GetCurrentThresholds()
+	log.Printf("[SERIAL] Current thresholds: %v", thresholds)
 	return true
 }
 
@@ -441,40 +462,38 @@ func handleWS(w http.ResponseWriter, r *http.Request) {
 		send: make(chan []interface{}, 256),
 	}
 
-	// Set read deadline for better connection management
-	conn.SetReadDeadline(time.Now().Add(time.Second * 60))
-	conn.SetPongHandler(func(string) error {
-		conn.SetReadDeadline(time.Now().Add(time.Second * 60))
-		return nil
-	})
-
 	clientsMux.Lock()
 	clients[client] = true
 	clientsMux.Unlock()
 
 	log.Println("Client connected")
 
-	// Start ping/pong routine
-	go func() {
-		ticker := time.NewTicker(time.Second * 30)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ticker.C:
-				if err := conn.WriteControl(websocket.PingMessage, []byte{}, time.Now().Add(time.Second*10)); err != nil {
-					return
-				}
-			case <-shutdownSignal:
-				return
-			}
+	// Send initial state (immediately, not via goroutine)
+	initialMsgs := [][]interface{}{
+		{"thresholds", map[string]interface{}{
+			"thresholds": profileHandler.GetCurrentThresholds(),
+		}},
+		{"get_profiles", map[string]interface{}{
+			"profiles": profileHandler.GetProfileNames(),
+		}},
+		{"get_cur_profile", map[string]interface{}{
+			"cur_profile": profileHandler.CurProfile,
+		}},
+	}
+
+	for _, msg := range initialMsgs {
+		err = conn.WriteJSON(msg)
+		if err != nil {
+			log.Printf("Error sending initial state: %v", err)
+			conn.Close()
+			return
 		}
-	}()
+	}
 
-	// Send initial thresholds
-	client.send <- []interface{}{"thresholds", map[string]interface{}{
-		"thresholds": profileHandler.GetCurrentThresholds(),
-	}}
+	// Request current thresholds from device
+	serialHandler.WriteQueue <- "t\n"
 
+	// Reader goroutine
 	go func() {
 		defer func() {
 			wsLock.Lock()
@@ -485,12 +504,12 @@ func handleWS(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 			wsLock.Unlock()
-			
+
 			conn.Close()
 			clientsMux.Lock()
 			delete(clients, client)
 			clientsMux.Unlock()
-			
+
 			log.Println("Client disconnected")
 		}()
 
@@ -504,7 +523,6 @@ func handleWS(w http.ResponseWriter, r *http.Request) {
 				break
 			}
 
-			// Handle incoming messages based on their type
 			if len(message) > 0 {
 				action, ok := message[0].(string)
 				if !ok {
@@ -555,7 +573,6 @@ func handleWS(w http.ResponseWriter, r *http.Request) {
 					if len(message) >= 2 {
 						if name, ok := message[1].(string); ok {
 							profileHandler.ChangeProfile(name)
-							// Apply thresholds to device
 							thresholds := profileHandler.GetCurrentThresholds()
 							for i, t := range thresholds {
 								serialHandler.WriteQueue <- fmt.Sprintf("%d %d\n", i, t)
@@ -578,27 +595,9 @@ func handleWS(w http.ResponseWriter, r *http.Request) {
 	}()
 }
 
-func cleanup() {
-	log.Println("Cleaning up connections...")
-	clientsMux.Lock()
-	for client := range clients {
-		client.conn.WriteMessage(websocket.CloseMessage,
-			websocket.FormatCloseMessage(websocket.CloseGoingAway, "Server shutdown"))
-		client.conn.Close()
-		delete(clients, client)
-	}
-	clientsMux.Unlock()
-
-	if serialHandler.SerialPort != nil {
-		serialHandler.SerialPort.Close()
-	}
-}
-
 func getIndex(w http.ResponseWriter, r *http.Request) {
 	http.ServeFile(w, r, filepath.Join(buildDir, "index.html"))
 }
-
-var buildDir = filepath.Join(filepath.Dir(os.Args[0]), "..", "build")
 
 func main() {
 	gamepad := flag.String("gamepad", "/dev/ttyACM0", "Serial port to use (e.g., COM5 on Windows, /dev/ttyACM0 on Linux)")
@@ -614,8 +613,7 @@ func main() {
 	go func() {
 		<-sigChan
 		log.Println("Shutting down...")
-		close(shutdownSignal)
-		cleanup()
+		onShutdown()
 		os.Exit(0)
 	}()
 
@@ -628,10 +626,11 @@ func main() {
 	go serialHandler.ReadLoop()
 
 	r := mux.NewRouter()
-	
-	// Core routes
-	r.HandleFunc("/ws", handleWS)
-	r.HandleFunc("/defaults", func(w http.ResponseWriter, r *http.Request) {
+
+	// API routes first (most specific)
+	apiRouter := r.PathPrefix("/api").Subrouter()
+	apiRouter.HandleFunc("/ws", handleWS)
+	apiRouter.HandleFunc("/defaults", func(w http.ResponseWriter, r *http.Request) {
 		response := map[string]interface{}{
 			"profiles":    profileHandler.GetProfileNames(),
 			"cur_profile": profileHandler.CurProfile,
@@ -642,21 +641,22 @@ func main() {
 
 	// Static file routes (only when not in NO_SERIAL mode)
 	if !serialHandler.NoSerial {
+		// Serve index.html for root and /plot
 		r.HandleFunc("/", getIndex)
 		r.HandleFunc("/plot", getIndex)
-		r.PathPrefix("/").Handler(http.FileServer(http.Dir(buildDir)))
+
+		// Serve static files
+		staticFileServer := http.FileServer(http.Dir(buildDir))
+		r.PathPrefix("/static/").Handler(staticFileServer)
+		r.PathPrefix("/favicon.ico").Handler(staticFileServer)
+		r.PathPrefix("/manifest.json").Handler(staticFileServer)
+		r.PathPrefix("/logo").Handler(staticFileServer)
 	}
 
 	http.Handle("/", r)
 
 	// Run startup hooks
 	onStartup()
-
-	// Set up shutdown handler
-	go func() {
-		<-shutdownSignal
-		onShutdown()
-	}()
 
 	// Find a non-loopback IPv4 address for display
 	ipToShow := "localhost"
